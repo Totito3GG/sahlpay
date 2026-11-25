@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+spark-warehouse/
+metastore_db/
+derby.log
+data/transactions_history.jsonl
+outputs/*
+!outputs/.gitkeep

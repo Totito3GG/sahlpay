@@ -1,0 +1,168 @@
+# SahlPay - plateforme Big Data (Projet Ecosysteme Big Data 2, EMSI 2026-2027)
+# Services : Kafka (KRaft), Spark Master + 2 Workers, MinIO, Jupyter (PySpark)
+# Lancement : docker compose up -d --build
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: docker/spark/Dockerfile
+  image: sahlpay-spark:3.5.3
+  environment: &spark-env
+    SPARK_NO_DAEMONIZE: "true"
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  networks: [sahlpay]
+
+services:
+
+  # ---------------------------------------------------------------- Kafka (mode KRaft, sans ZooKeeper)
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: sahlpay-kafka
+    hostname: kafka
+    ports:
+      - "29092:29092"          # acces depuis la machine hote (producer.py lance hors Docker)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    networks: [sahlpay]
+
+  # Creation du topic "transactions" (3 partitions), puis le conteneur s'arrete
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: sahlpay-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic transactions --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic transactions
+    networks: [sahlpay]
+
+  # ---------------------------------------------------------------- MinIO (stockage objet compatible S3)
+  # Les images officielles minio/minio et minio/mc ont ete retirees de Docker Hub par MinIO :
+  # on utilise les images gratuites de Chainguard (point d'entree deja = minio / mc).
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: sahlpay-minio
+    hostname: minio
+    user: "0:0"                # evite l'erreur de permission sur le volume (l'image tourne en uid 65532)
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"            # API S3
+      - "9001:9001"            # console web
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    networks: [sahlpay]
+
+  # Client MinIO : cree le bucket "lake" au demarrage (relance jusqu'a ce que MinIO reponde), puis s'arrete.
+  # Commandes ponctuelles (le point d'entree est deja "mc") :
+  #   docker compose run --rm mc cp /data/merchants.json local/lake/reference/merchants.json
+  #   docker compose run --rm mc ls --recursive local/lake/        <- capture demandee
+  mc:
+    image: cgr.dev/chainguard/minio-client:latest
+    container_name: sahlpay-mc
+    user: "0:0"
+    depends_on: [minio]
+    restart: on-failure
+    environment:
+      MC_HOST_local: http://${MINIO_ROOT_USER:-minioadmin}:${MINIO_ROOT_PASSWORD:-minioadmin}@minio:9000
+      MC_CONFIG_DIR: /tmp/mc
+    volumes:
+      - ./data:/data
+    command: ["mb", "--ignore-existing", "local/lake"]
+    networks: [sahlpay]
+
+  # ---------------------------------------------------------------- Spark standalone : 1 Master + 2 Workers
+  spark-master:
+    <<: *spark-common
+    container_name: sahlpay-spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"            # Spark Master UI
+      - "7077:7077"
+
+  spark-worker-1:
+    <<: *spark-common
+    container_name: sahlpay-spark-worker-1
+    hostname: spark-worker-1
+    depends_on: [spark-master]
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077", "--webui-port", "8081"]
+    ports:
+      - "8081:8081"
+
+  spark-worker-2:
+    <<: *spark-common
+    container_name: sahlpay-spark-worker-2
+    hostname: spark-worker-2
+    depends_on: [spark-master]
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "spark://spark-master:7077", "--webui-port", "8082"]
+    ports:
+      - "8082:8082"
+
+  # ---------------------------------------------------------------- Jupyter : le Driver Spark tourne ici
+  jupyter:
+    <<: *spark-common
+    container_name: sahlpay-jupyter
+    hostname: jupyter
+    depends_on: [spark-master, minio, kafka]
+    environment:
+      <<: *spark-env
+      SPARK_MASTER_URL: spark://spark-master:7077
+      KAFKA_BOOTSTRAP: kafka:9092
+    working_dir: /workspace
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root",
+              "--ServerApp.token=", "--ServerApp.password=", "--notebook-dir=/workspace"]
+    ports:
+      - "8888:8888"            # JupyterLab
+      - "4040:4040"            # Spark UI de l'application (DAG, stages)
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./producer:/workspace/producer
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+
+volumes:
+  minio-data:
+
+networks:
+  sahlpay:
+    name: sahlpay
